@@ -29,7 +29,8 @@ from _pytest.deprecated import check_ispytest
 from _pytest.deprecated import PARAMETRIZE_NON_COLLECTION_ITERABLE
 from _pytest.outcomes import fail
 from _pytest.raises import AbstractRaises
-from _pytest.scope import _ScopeName
+from _pytest.scope import ScopeName
+from _pytest.warning_types import PytestCollectionWarning
 from _pytest.warning_types import PytestUnknownMarkWarning
 
 
@@ -170,8 +171,12 @@ class ParameterSet(NamedTuple):
         **kwargs,
     ) -> tuple[Sequence[str], bool]:
         if isinstance(argnames, str):
+            # A trailing comma indicates tuple-style: "arg," is equivalent to ("arg",)
+            # In this case, argvalues should be a list of tuples, not wrapped values.
+            # See https://github.com/pytest-dev/pytest/issues/719
+            has_trailing_comma = argnames.rstrip().endswith(",")
             argnames = [x.strip() for x in argnames.split(",") if x.strip()]
-            force_tuple = len(argnames) == 1
+            force_tuple = len(argnames) == 1 and not has_trailing_comma
         else:
             force_tuple = False
         return argnames, force_tuple
@@ -439,7 +444,18 @@ def get_unpacked_marks(
                 mark_list.append(item)
     else:
         mark_attribute = getattr(obj, "pytestmark", [])
-        if isinstance(mark_attribute, list):
+        if mark_attribute is None:
+            warnings.warn(
+                "Module defines a `__getattr__` which returns None for "
+                "'pytestmark' instead of raising AttributeError. "
+                "Make sure `__getattr__` raises AttributeError for "
+                "attributes it does not provide. "
+                "See https://github.com/pytest-dev/pytest/issues/8265",
+                PytestCollectionWarning,
+                stacklevel=2,
+            )
+            mark_list = []
+        elif isinstance(mark_attribute, list):
             mark_list = mark_attribute
         else:
             mark_list = [mark_attribute]
@@ -528,10 +544,10 @@ if TYPE_CHECKING:
             argvalues: Collection[ParameterSet | Sequence[object] | object],
             *,
             indirect: bool | Sequence[str] = ...,
-            ids: Iterable[None | str | float | int | bool]
+            ids: Iterable[None | str | float | int | bool | _HiddenParam]
             | Callable[[Any], object | None]
             | None = ...,
-            scope: _ScopeName | None = ...,
+            scope: ScopeName | None = ...,
         ) -> MarkDecorator: ...
 
         @overload
@@ -548,7 +564,7 @@ if TYPE_CHECKING:
             ids: Iterable[None | str | float | int | bool]
             | Callable[[Any], object | None]
             | None = ...,
-            scope: _ScopeName | None = ...,
+            scope: ScopeName | None = ...,
         ) -> MarkDecorator: ...
 
     class _UsefixturesMarkDecorator(MarkDecorator):

@@ -100,8 +100,12 @@ class UnitTestCase(Class):
             self._register_unittest_setup_method_fixture(cls)
             self._register_unittest_setup_class_fixture(cls)
             self._register_setup_class_fixture()
+        else:
+            self._register_unittest_skip_fixture(cls)
 
-        self.session._fixturemanager.parsefactories(self.newinstance(), self.nodeid)
+        self.session._fixturemanager.parsefactories(
+            holder=self.newinstance(), node=self
+        )
 
         loader = TestLoader()
         foundsomething = False
@@ -170,7 +174,23 @@ class UnitTestCase(Class):
             # Use a unique name to speed up lookup.
             name=f"_unittest_setUpClass_fixture_{cls.__qualname__}",
             func=unittest_setup_class_fixture,
-            nodeid=self.nodeid,
+            node=self,
+            scope="class",
+            autouse=True,
+        )
+
+    def _register_unittest_skip_fixture(self, cls: type) -> None:
+        """Register an auto-use fixture to skip tests for a class decorated
+        with @unittest.skip or @unittest.skipIf (#13885)."""
+
+        def unittest_skip_fixture(request: FixtureRequest) -> None:
+            reason = getattr(cls, "__unittest_skip_why__", "")
+            raise skip.Exception(reason, _use_item_location=True)
+
+        self.session._fixturemanager._register_fixture(
+            name=f"_unittest_skip_fixture_{cls.__qualname__}",
+            func=unittest_skip_fixture,
+            node=self,
             scope="class",
             autouse=True,
         )
@@ -200,7 +220,7 @@ class UnitTestCase(Class):
             # Use a unique name to speed up lookup.
             name=f"_unittest_setup_method_fixture_{cls.__qualname__}",
             func=unittest_setup_method_fixture,
-            nodeid=self.nodeid,
+            node=self,
             scope="function",
             autouse=True,
         )
@@ -409,6 +429,10 @@ class TestCaseFunction(Function):
         | tuple[type[BaseException], BaseException, TracebackType]
         | None,
     ) -> None:
+        # Importing this private symbol locally in case this symbol is renamed/removed in the future; importing
+        # it globally would break pytest entirely, importing it locally only will break unittests using `addSubTest`.
+        from unittest.case import _subtest_msg_sentinel  # type: ignore[attr-defined]
+
         exception_info: ExceptionInfo[BaseException] | None
         match exc_info:
             case tuple():
@@ -427,7 +451,7 @@ class TestCaseFunction(Function):
             when="call",
             _ispytest=True,
         )
-        msg = test._message if isinstance(test._message, str) else None  # type: ignore[attr-defined]
+        msg = None if test._message is _subtest_msg_sentinel else str(test._message)  # type: ignore[attr-defined]
         report = self.ihook.pytest_runtest_makereport(item=self, call=call_info)
         sub_report = SubtestReport._new(
             report,
