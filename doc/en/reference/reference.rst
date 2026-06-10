@@ -883,6 +883,12 @@ Item
     :members:
     :show-inheritance:
 
+ItemLocation
+~~~~~~~~~~~~
+
+.. autoclass:: pytest.ItemLocation
+    :members:
+
 File
 ~~~~
 
