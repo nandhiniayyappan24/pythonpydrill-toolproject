@@ -948,85 +948,6 @@ class TestAssert_reprcompare:
             "Use -v to get more diff",
         ]
 
-    def test_mapping_extra_items_capped_keeps_count_in_header(self) -> None:
-        # When there are more extra keys than the truncation budget, the
-        # "N more items" subdict is not pretty-printed in full (that work
-        # would be thrown away by truncation); only the smallest budget
-        # keys are emitted, one per line. The count stays in the header, so
-        # no information the user would have seen is lost.
-        from _pytest.assertion._compare_mapping import _compare_eq_mapping
-
-        left: dict[object, object] = {i: i for i in range(2000)}
-        capped = list(_compare_eq_mapping(left, {}, util.dummy_highlighter, 0, 8))
-        # Header reports the true count regardless of the cap.
-        assert capped[0] == "Left contains 2000 more items:"
-        # Body bounded to the budget, one key per line (not a pprint block).
-        body = capped[1:]
-        assert len(body) == 8
-        assert body[0] == "{0: 0}"
-        # The keys shown are the ones pprint would have led with (smallest).
-        assert body == [f"{{{i}: {i}}}" for i in range(8)]
-
-    def test_mapping_extra_items_uncapped_keeps_pprint_block(self) -> None:
-        # Without a budget (``-vv`` / CI / disabled truncation) the full,
-        # compact pprint block is preserved unchanged.
-        from _pytest.assertion._compare_mapping import _compare_eq_mapping
-
-        left: dict[object, object] = {i: i for i in range(20)}
-        uncapped = list(_compare_eq_mapping(left, {}, util.dummy_highlighter, 0, None))
-        assert uncapped[0] == "Left contains 20 more items:"
-        # A pprint block opens with "{" and closes with "}".
-        assert uncapped[1].startswith("{")
-        assert uncapped[-1].endswith("}")
-        assert len(uncapped) > 8
-
-    def test_mapping_extra_items_formatting_work_is_bounded(self) -> None:
-        # Non-regression guard: capping the *output* to N lines is not
-        # enough — an implementation that pretty-prints the whole subdict
-        # and then slices to N lines produces the same N lines while doing
-        # O(N) formatting. Count the value ``repr`` calls (deterministic,
-        # timing-free) and assert they stay flat as the input grows; they
-        # explode to O(N) the moment the full-subdict pformat comes back.
-        from _pytest.assertion._compare_mapping import _compare_eq_mapping
-
-        class Tracked:
-            reprs = 0
-
-            def __init__(self, v: int) -> None:
-                self.v = v
-
-            def __repr__(self) -> str:
-                Tracked.reprs += 1
-                return f"T({self.v})"
-
-        def reprs_for(n: int) -> int:
-            left: dict[object, object] = {i: Tracked(i) for i in range(n)}
-            Tracked.reprs = 0  # count formatting only, not construction
-            list(_compare_eq_mapping(left, {}, util.dummy_highlighter, 0, 8))
-            return Tracked.reprs
-
-        small = reprs_for(1_000)
-        big = reprs_for(100_000)
-        assert small == big  # work independent of input size
-        assert big < 50  # only the budget's worth of values are formatted
-
-    def test_mapping_extra_items_cap_preserves_truncation_footer(
-        self, pytester: Pytester
-    ) -> None:
-        # End-to-end: the capped subdict still leaves the iterable "Full
-        # diff" fallback to feed truncation, so the exact hidden-line count
-        # in the footer is preserved (this PR does not drop it).
-        pytester.makepyfile(
-            "def test_x():\n    assert {i: i for i in range(2000)} == {}\n"
-        )
-        result = pytester.runpytest("-v")
-        result.stdout.fnmatch_lines(
-            [
-                "*Left contains 2000 more items:*",
-                "*Full output truncated (* lines hidden), use '-vv' to show*",
-            ]
-        )
-
     def test_sequence_different_items(self) -> None:
         lines = callequal((1, 2), (3, 4, 5), verbose=2)
         assert lines == [
@@ -1247,7 +1168,7 @@ class TestAssert_reprcompare_dataclass:
                 "E         Drill down into differing attribute g:",
                 "E           g: S(a=10, b='ten') != S(a=20, b='xxx')...",
                 "E         ",
-                "E         ...Full output truncated (51 lines hidden), use '-vv' to show",
+                "E         ...Full output truncated, use '-vv' to show",
             ],
             consecutive=True,
         )
@@ -1626,7 +1547,6 @@ class TestTruncateExplanation:
         assert result != expl
         assert len(result) == 8 + self.LINES_IN_TRUNCATION_MSG
         assert "Full output truncated" in result[-1]
-        assert "42 lines hidden" in result[-1]
         last_line_before_trunc_msg = result[-self.LINES_IN_TRUNCATION_MSG - 1]
         assert last_line_before_trunc_msg.endswith("...")
 
@@ -1639,7 +1559,6 @@ class TestTruncateExplanation:
         assert result != expl
         assert len(result) == 8 + self.LINES_IN_TRUNCATION_MSG
         assert "Full output truncated" in result[-1]
-        assert f"{total_lines - 8} lines hidden" in result[-1]
         last_line_before_trunc_msg = result[-self.LINES_IN_TRUNCATION_MSG - 1]
         assert last_line_before_trunc_msg.endswith("...")
 
@@ -1662,7 +1581,7 @@ class TestTruncateExplanation:
             "a" * 10,
             "...",
             "",
-            "...Full output truncated (1 line hidden), use '-vv' to show",
+            "...Full output truncated, use '-vv' to show",
         ]
 
     def test_truncates_edgecase_when_truncation_message_makes_the_result_longer_for_chars(
@@ -1693,7 +1612,6 @@ class TestTruncateExplanation:
         assert result != expl
         assert len(result) == 16 - 8 + self.LINES_IN_TRUNCATION_MSG
         assert "Full output truncated" in result[-1]
-        assert "8 lines hidden" in result[-1]
         last_line_before_trunc_msg = result[-self.LINES_IN_TRUNCATION_MSG - 1]
         assert last_line_before_trunc_msg.endswith("...")
 
@@ -1705,7 +1623,6 @@ class TestTruncateExplanation:
         assert result != expl
         assert len(result) == 4 + self.LINES_IN_TRUNCATION_MSG
         assert "Full output truncated" in result[-1]
-        assert "7 lines hidden" in result[-1]
         last_line_before_trunc_msg = result[-self.LINES_IN_TRUNCATION_MSG - 1]
         assert last_line_before_trunc_msg.endswith("...")
 
@@ -1717,7 +1634,6 @@ class TestTruncateExplanation:
         assert result != expl
         assert len(result) == 1 + self.LINES_IN_TRUNCATION_MSG
         assert "Full output truncated" in result[-1]
-        assert "1000 lines hidden" in result[-1]
         last_line_before_trunc_msg = result[-self.LINES_IN_TRUNCATION_MSG - 1]
         assert last_line_before_trunc_msg.endswith("...")
 
@@ -1725,7 +1641,6 @@ class TestTruncateExplanation:
         """Test against full runpytest() output."""
         line_count = 7
         line_len = 100
-        expected_truncated_lines = 2
         pytester.makepyfile(
             rf"""
             def test_many_lines():
@@ -1744,7 +1659,7 @@ class TestTruncateExplanation:
             [
                 "*+ 1*",
                 "*+ 3*",
-                f"*truncated ({expected_truncated_lines} lines hidden)*use*-vv*",
+                "*Full output truncated*use*-vv*",
             ]
         )
 
@@ -1758,7 +1673,7 @@ class TestTruncateExplanation:
             [
                 "*+ 1*",
                 "*+ 3*",
-                f"*truncated ({expected_truncated_lines} lines hidden)*use*-vv*",
+                "*Full output truncated*use*-vv*",
             ]
         )
 
@@ -1773,7 +1688,7 @@ class TestTruncateExplanation:
             (4, None, 0),
             (0, None, 0),
             (None, 8, 6),
-            (None, 9, 0),
+            (None, 33, 0),
             (None, 0, 0),
             (0, 0, 0),
             (0, 1000, 0),
@@ -1800,7 +1715,7 @@ class TestTruncateExplanation:
 
         # This test produces 6 lines of diff output or 79 characters
         # So the effect should be when threshold is < 4 lines (considering 2 additional lines for explanation)
-        # Or < 9 characters (considering 70 additional characters for explanation)
+        # Or < 33 characters (considering the ~46-char footer slack, see truncate.TRUNCATION_FOOTER_CHARS)
 
         monkeypatch.delenv("CI", raising=False)
 
@@ -1814,9 +1729,7 @@ class TestTruncateExplanation:
         result = pytester.runpytest()
 
         if expected_lines_hidden != 0:
-            result.stdout.fnmatch_lines(
-                [f"*truncated ({expected_lines_hidden} lines hidden)*"]
-            )
+            result.stdout.fnmatch_lines(["*Full output truncated*"])
         else:
             result.stdout.no_fnmatch_line("*truncated*")
             result.stdout.fnmatch_lines(
