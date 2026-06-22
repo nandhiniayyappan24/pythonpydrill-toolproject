@@ -12,6 +12,8 @@ from typing import TYPE_CHECKING
 from _pytest.assertion import rewrite
 from _pytest.assertion import truncate
 from _pytest.assertion import util
+from _pytest.assertion._typing import NO_TRUNCATION_BUDGET
+from _pytest.assertion._typing import TruncationBudget
 from _pytest.assertion.rewrite import assertstate_key
 from _pytest.config import Config
 from _pytest.config import hookimpl
@@ -226,28 +228,51 @@ def pytest_sessionfinish(session: Session) -> None:
 def pytest_assertrepr_compare(
     config: Config, op: str, left: Any, right: Any
 ) -> list[str] | None:
+    """Return an explanation for ``left op right``.
+
+    Internally ``util.assertrepr_compare`` is a generator; we feed it
+    through ``materialize_with_truncation`` so a huge comparison
+    short-circuits at the truncation threshold without building the
+    full diff, while still returning the ``list[str] | None`` shape
+    the hook spec advertises.
+    """
     if config.pluginmanager.has_plugin("terminalreporter"):
         highlighter = config.get_terminal_writer()._highlight
     else:
         # Keep it plaintext when not using terminalrepoterer (#14377).
         highlighter = util.dummy_highlighter
-    # When the explanation is going to be truncated to ``max_lines`` anyway,
-    # tell the mapping comparison not to pretty-print a giant "N more items"
-    # subdict it would only throw away — the item count is already reported
-    # in the header, so this loses no information the user would have seen.
+    # When truncation is going to clip the explanation downstream, tell the
+    # comparison helpers to cap their pformat output at the same budget so they
+    # don't spend O(N) formatting lines/chars we're about to drop. The cap is
+    # ``(max_lines, max_chars)`` per side, matching what the truncator will
+    # actually pull (the raw limit plus the footer slack — see
+    # ``truncate.TRUNCATION_FOOTER_LINES`` / ``TRUNCATION_FOOTER_CHARS``), so a
+    # side is never under-formatted.
+    #
+    # ``difflib.ndiff`` over two K-line/char pformat outputs produces at least
+    # K output lines/chars (more when the sides differ), and the truncator
+    # pulls at most that much, so a per-side budget covers the worst case. A
+    # dimension whose limit is 0 (disabled) stays ``0`` so it isn't bounded;
+    # with truncation off both stay ``0`` and the user gets the full diff.
     should_truncate, base_budget = truncate._get_truncation_parameters(config)
-    extra_items_max_lines = (
-        base_budget.max_lines if should_truncate and base_budget.max_lines > 0 else None
-    )
-    explanation = list(
-        util.assertrepr_compare(
-            op=op,
-            left=left,
-            right=right,
-            verbose=config.get_verbosity(Config.VERBOSITY_ASSERTIONS),
-            highlighter=highlighter,
-            assertion_text_diff_style=util.get_assertion_text_diff_style(config),
-            extra_items_max_lines=extra_items_max_lines,
+    if should_truncate:
+        truncation_budget = TruncationBudget(
+            max_lines=base_budget.max_lines + truncate.TRUNCATION_FOOTER_LINES + 1
+            if base_budget.max_lines > 0
+            else 0,
+            max_chars=base_budget.max_chars + truncate.TRUNCATION_FOOTER_CHARS
+            if base_budget.max_chars > 0
+            else 0,
         )
+    else:
+        truncation_budget = NO_TRUNCATION_BUDGET
+    lines = util.assertrepr_compare(
+        op=op,
+        left=left,
+        right=right,
+        verbose=config.get_verbosity(Config.VERBOSITY_ASSERTIONS),
+        highlighter=highlighter,
+        assertion_text_diff_style=util.get_assertion_text_diff_style(config),
+        truncation_budget=truncation_budget,
     )
-    return explanation or None
+    return truncate.materialize_with_truncation(lines, config) or None
