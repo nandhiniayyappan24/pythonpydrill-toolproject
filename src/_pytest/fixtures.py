@@ -1409,7 +1409,9 @@ class FixtureFunctionDefinition:
     def __repr__(self) -> str:
         return f"<pytest_fixture({self._fixture_function})>"
 
-    def __get__(self, instance, owner=None):
+    def __get__(
+        self, instance: object, owner: type | None = None
+    ) -> FixtureFunctionDefinition:
         """Behave like a method if the function it was applied to was a method."""
         return FixtureFunctionDefinition(
             function=self._fixture_function,
@@ -2024,6 +2026,65 @@ class FixtureManager:
                 # Global plugin autouse fixtures go under Session.
                 self._node_autousenames.setdefault(self.session, []).append(name)
 
+    def _find_wrapped_fixture_def(
+        self, obj: object
+    ) -> FixtureFunctionDefinition | None:
+        """Walk through wrapper chain to find a FixtureFunctionDefinition.
+
+        Returns the FixtureFunctionDefinition if found in the wrapper chain,
+        None otherwise. Handles loops and special objects safely.
+        """
+        from _pytest.compat import safe_getattr
+
+        # Skip mock objects to avoid false positives when traversing
+        # their wrapper chains (they have a _mock_name attribute).
+        if safe_getattr(obj, "_mock_name", None) is not None:
+            return None
+
+        current = obj
+        seen: set[int] = set()
+
+        for _ in range(100):
+            if current is None:
+                break
+
+            current_id = id(current)
+            if current_id in seen:
+                return None
+            seen.add(current_id)
+
+            try:
+                if isinstance(current, FixtureFunctionDefinition):
+                    return current
+            except Exception:
+                return None
+
+            # safe_getattr handles "evil objects" that raise on attribute
+            # access (see pytest#214).
+            current = safe_getattr(current, "__wrapped__", None)
+
+        return None
+
+    def _check_for_wrapped_fixture(
+        self, holder: object, name: str, obj: object
+    ) -> None:
+        """Check if an object might be a fixture wrapped in decorators and warn if so."""
+        if obj is None:
+            return
+
+        fixture_def = self._find_wrapped_fixture_def(obj)
+
+        if fixture_def is not None and fixture_def is not obj:
+            from types import FunctionType
+
+            from _pytest.warning_types import PytestWarning
+            from _pytest.warning_types import warn_explicit_for
+
+            fixture_func = fixture_def._get_wrapped_function()
+            if isinstance(fixture_func, FunctionType):
+                msg = f"cannot discover {name} due to being wrapped in decorators"
+                warn_explicit_for(fixture_func, PytestWarning(msg))
+
     @overload
     def parsefactories(
         self,
@@ -2131,6 +2192,9 @@ class FixtureManager:
                     node=effective_node,
                     nodeid=effective_nodeid,
                 )
+            else:
+                # Check if this might be a wrapped fixture that we can't discover
+                self._check_for_wrapped_fixture(holderobj, name, obj_ub)
 
     def getfixturedefs(
         self, argname: str, node: nodes.Node
