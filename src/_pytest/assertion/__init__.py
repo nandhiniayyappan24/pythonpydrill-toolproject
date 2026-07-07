@@ -12,6 +12,8 @@ from typing import TYPE_CHECKING
 from _pytest.assertion import rewrite
 from _pytest.assertion import truncate
 from _pytest.assertion import util
+from _pytest.assertion._typing import NO_TRUNCATION_BUDGET
+from _pytest.assertion._typing import TruncationBudget
 from _pytest.assertion.rewrite import assertstate_key
 from _pytest.config import Config
 from _pytest.config import hookimpl
@@ -181,13 +183,21 @@ def pytest_runtest_protocol(item: Item) -> Generator[None, object, object]:
             config=item.config, op=op, left=left, right=right
         )
         for new_expl in hook_result:
+            # Plugin-supplied lists are truncated here; the built-in impl
+            # already truncates as it streams, so re-applying truncation
+            # to its output is a near no-op (the body fits the budget,
+            # only the footer line is re-emitted with the same wording).
+            # ``materialize_with_truncation`` can return ``[]`` when the
+            # input was a truthy-but-empty iterable, so re-check after
+            # materialising.
             if new_expl:
-                new_expl = truncate.truncate_if_required(new_expl, item)
-                new_expl = [line.replace("\n", "\\n") for line in new_expl]
-                res = "\n~".join(new_expl)
-                if item.config.getvalue("assertmode") == "rewrite":
-                    res = res.replace("%", "%%")
-                return res
+                new_expl = truncate.materialize_with_truncation(new_expl, item.config)
+                if new_expl:
+                    new_expl = [line.replace("\n", "\\n") for line in new_expl]
+                    res = "\n~".join(new_expl)
+                    if item.config.getvalue("assertmode") == "rewrite":
+                        res = res.replace("%", "%%")
+                    return res
         return None
 
     saved_assert_hooks = util._reprcompare, util._assertion_pass
@@ -218,19 +228,51 @@ def pytest_sessionfinish(session: Session) -> None:
 def pytest_assertrepr_compare(
     config: Config, op: str, left: Any, right: Any
 ) -> list[str] | None:
+    """Return an explanation for ``left op right``.
+
+    Internally ``util.assertrepr_compare`` is a generator; we feed it
+    through ``materialize_with_truncation`` so a huge comparison
+    short-circuits at the truncation threshold without building the
+    full diff, while still returning the ``list[str] | None`` shape
+    the hook spec advertises.
+    """
     if config.pluginmanager.has_plugin("terminalreporter"):
         highlighter = config.get_terminal_writer()._highlight
     else:
         # Keep it plaintext when not using terminalrepoterer (#14377).
         highlighter = util.dummy_highlighter
-    explanation = list(
-        util.assertrepr_compare(
-            op=op,
-            left=left,
-            right=right,
-            verbose=config.get_verbosity(Config.VERBOSITY_ASSERTIONS),
-            highlighter=highlighter,
-            assertion_text_diff_style=util.get_assertion_text_diff_style(config),
+    # When truncation is going to clip the explanation downstream, tell the
+    # comparison helpers to cap their pformat output at the same budget so they
+    # don't spend O(N) formatting lines/chars we're about to drop. The cap is
+    # ``(max_lines, max_chars)`` per side, matching what the truncator will
+    # actually pull (the raw limit plus the footer slack — see
+    # ``truncate.TRUNCATION_FOOTER_LINES`` / ``TRUNCATION_FOOTER_CHARS``), so a
+    # side is never under-formatted.
+    #
+    # ``difflib.ndiff`` over two K-line/char pformat outputs produces at least
+    # K output lines/chars (more when the sides differ), and the truncator
+    # pulls at most that much, so a per-side budget covers the worst case. A
+    # dimension whose limit is 0 (disabled) stays ``0`` so it isn't bounded;
+    # with truncation off both stay ``0`` and the user gets the full diff.
+    should_truncate, base_budget = truncate._get_truncation_parameters(config)
+    if should_truncate:
+        truncation_budget = TruncationBudget(
+            max_lines=base_budget.max_lines + truncate.TRUNCATION_FOOTER_LINES + 1
+            if base_budget.max_lines > 0
+            else 0,
+            max_chars=base_budget.max_chars + truncate.TRUNCATION_FOOTER_CHARS
+            if base_budget.max_chars > 0
+            else 0,
         )
+    else:
+        truncation_budget = NO_TRUNCATION_BUDGET
+    lines = util.assertrepr_compare(
+        op=op,
+        left=left,
+        right=right,
+        verbose=config.get_verbosity(Config.VERBOSITY_ASSERTIONS),
+        highlighter=highlighter,
+        assertion_text_diff_style=util.get_assertion_text_diff_style(config),
+        truncation_budget=truncation_budget,
     )
-    return explanation or None
+    return truncate.materialize_with_truncation(lines, config) or None

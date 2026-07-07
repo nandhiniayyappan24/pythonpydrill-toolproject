@@ -17,8 +17,10 @@ import _pytest.assertion as plugin
 from _pytest.assertion import truncate
 from _pytest.assertion import util
 from _pytest.assertion._compare_any import _compare_eq_cls
+from _pytest.assertion._typing import NO_TRUNCATION_BUDGET
 from _pytest.assertion._typing import TruncationBudget
 from _pytest.assertion.compare_text import _compare_eq_text
+from _pytest.assertion.compare_text import _notin_text
 from _pytest.config import Config as _Config
 from _pytest.monkeypatch import MonkeyPatch
 from _pytest.pytester import Pytester
@@ -29,6 +31,9 @@ def mock_config(
     verbose: int = 0,
     assertion_override: int | None = None,
     assertion_text_diff_style: str = util.ASSERTION_TEXT_DIFF_STYLE_NDIFF,
+    truncation_limit_lines: str = "0",
+    truncation_limit_chars: str = "0",
+    has_terminalreporter: bool = True,
 ):
     class TerminalWriter:
         def _highlight(self, source, lexer="python"):
@@ -36,12 +41,18 @@ def mock_config(
 
     class PluginManager:
         def has_plugin(self, name: str) -> bool:
-            return True
+            return has_terminalreporter
 
     class Config:
         pluginmanager = PluginManager()
 
         def get_terminal_writer(self):
+            # When the terminalreporter plugin is absent the dispatcher must
+            # fall back to the plaintext highlighter without reaching for a
+            # terminal writer (#14377); make that misuse fail loudly.
+            assert has_terminalreporter, (
+                "get_terminal_writer() must not be called without terminalreporter"
+            )
             return TerminalWriter()
 
         def get_verbosity(self, verbosity_type: str | None = None) -> int:
@@ -57,6 +68,13 @@ def mock_config(
         def getini(self, name: str) -> str:
             if name == util.ASSERTION_TEXT_DIFF_STYLE_INI:
                 return assertion_text_diff_style
+            # Truncation defaults to disabled (``"0"``) so ``callop``-style
+            # tests can compare against the full explanation; the dispatcher
+            # tests pass explicit limits to exercise the budget wiring.
+            if name == "truncation_limit_lines":
+                return truncation_limit_lines
+            if name == "truncation_limit_chars":
+                return truncation_limit_chars
             raise KeyError(f"Not mocked out: {name}")
 
     return Config()
@@ -492,6 +510,67 @@ class TestAssert_reprcompare:
             "+ spam",
         ]
 
+    def test_text_diff_budget_caps_ndiff_input(self) -> None:
+        # A large text diff fed a truncation budget caps the inputs to
+        # ndiff, so the result is bounded instead of growing with N.
+        left = "\n".join(f"left {i}" for i in range(1000))
+        right = "\n".join(f"right {i}" for i in range(1000))
+        ndiff_style = util.ASSERTION_TEXT_DIFF_STYLE_NDIFF
+        capped = list(
+            _compare_eq_text(
+                left,
+                right,
+                util.dummy_highlighter,
+                1,
+                ndiff_style,
+                TruncationBudget(max_lines=11, max_chars=710),
+            )
+        )
+        full = list(
+            _compare_eq_text(
+                left,
+                right,
+                util.dummy_highlighter,
+                1,
+                ndiff_style,
+                NO_TRUNCATION_BUDGET,
+            )
+        )
+        assert len(capped) < 80
+        assert len(full) > 1500
+        # a few huge lines: the char budget bounds each emitted line.
+        capped_chars = list(
+            _compare_eq_text(
+                "x" * 100_000,
+                "y" * 100_000,
+                util.dummy_highlighter,
+                1,
+                ndiff_style,
+                TruncationBudget(max_lines=11, max_chars=710),
+            )
+        )
+        assert all(len(line) < 1000 for line in capped_chars)
+
+    def test_notin_text_budget_caps_ndiff_input(self) -> None:
+        # ``assert term not in huge_text`` runs the same ndiff machinery as
+        # ``==`` and must be capped the same way: without a budget it scans
+        # the whole text (O(N)); with one the inputs to ndiff are sliced
+        # first, so the work is bounded regardless of how big the haystack
+        # is. The needle sits in the middle so an uncapped diff would have
+        # to walk past ~N identical chars to reach it.
+        needle = "NEEDLE"
+        text = "a" * 100_000 + needle + "a" * 100_000
+        capped = list(
+            _notin_text(needle, text, 1, TruncationBudget(max_lines=11, max_chars=710))
+        )
+        full = list(_notin_text(needle, text, 1, NO_TRUNCATION_BUDGET))
+        # Capped: a handful of short lines, each within the char budget.
+        assert len(capped) < 80
+        assert all(len(line) < 1000 for line in capped)
+        # Uncapped: the diff balloons with the input — proving the cap is
+        # what bounds it, not some unrelated early-out.
+        assert sum(len(line) for line in full) > 100_000
+
     def test_text_skipping(self) -> None:
         lines = callequal("a" * 50 + "spam", "a" * 50 + "eggs")
         assert lines is not None
@@ -911,6 +990,40 @@ class TestAssert_reprcompare:
             "  }",
         ]
 
+    def test_dict_extra_items_bounded_under_budget(self) -> None:
+        # Many extra keys + a truncation budget: the subdict is not
+        # pretty-printed in full; only the smallest ``max_lines`` keys are
+        # emitted, one per line (deterministic, char-bounded).
+        from _pytest.assertion._compare_mapping import _compare_eq_mapping
+
+        out = list(
+            _compare_eq_mapping(
+                {i: i for i in range(1000)},
+                {},
+                util.dummy_highlighter,
+                0,
+                TruncationBudget(max_lines=5, max_chars=350),
+            )
+        )
+        assert out[0] == "Left contains 1000 more items:"
+        body = out[1:]
+        assert body == [f"{{{i}: {i}}}" for i in range(5)]  # smallest 5, sorted
+
+    def test_dict_extra_items_small_keeps_pformat_block(self) -> None:
+        # Under the budget, the compact key-sorted pprint block is unchanged.
+        from _pytest.assertion._compare_mapping import _compare_eq_mapping
+
+        out = list(
+            _compare_eq_mapping(
+                {"b": 2, "a": 1},
+                {},
+                util.dummy_highlighter,
+                0,
+                TruncationBudget(max_lines=5, max_chars=350),
+            )
+        )
+        assert out == ["Left contains 2 more items:", "{'a': 1, 'b': 2}"]
+
     def test_mapping_different_items(self) -> None:
         class SimpleMapping(Mapping[str, int]):
             def __init__(self, values: dict[str, int]) -> None:
@@ -1163,7 +1276,7 @@ class TestAssert_reprcompare_dataclass:
                 "E         Drill down into differing attribute g:",
                 "E           g: S(a=10, b='ten') != S(a=20, b='xxx')...",
                 "E         ",
-                "E         ...Full output truncated (51 lines hidden), use '-vv' to show",
+                "E         ...Full output truncated, use '-vv' to show",
             ],
             consecutive=True,
         )
@@ -1542,7 +1655,6 @@ class TestTruncateExplanation:
         assert result != expl
         assert len(result) == 8 + self.LINES_IN_TRUNCATION_MSG
         assert "Full output truncated" in result[-1]
-        assert "42 lines hidden" in result[-1]
         last_line_before_trunc_msg = result[-self.LINES_IN_TRUNCATION_MSG - 1]
         assert last_line_before_trunc_msg.endswith("...")
 
@@ -1555,7 +1667,6 @@ class TestTruncateExplanation:
         assert result != expl
         assert len(result) == 8 + self.LINES_IN_TRUNCATION_MSG
         assert "Full output truncated" in result[-1]
-        assert f"{total_lines - 8} lines hidden" in result[-1]
         last_line_before_trunc_msg = result[-self.LINES_IN_TRUNCATION_MSG - 1]
         assert last_line_before_trunc_msg.endswith("...")
 
@@ -1578,7 +1689,7 @@ class TestTruncateExplanation:
             "a" * 10,
             "...",
             "",
-            "...Full output truncated (1 line hidden), use '-vv' to show",
+            "...Full output truncated, use '-vv' to show",
         ]
 
     def test_truncates_edgecase_when_truncation_message_makes_the_result_longer_for_chars(
@@ -1609,7 +1720,6 @@ class TestTruncateExplanation:
         assert result != expl
         assert len(result) == 16 - 8 + self.LINES_IN_TRUNCATION_MSG
         assert "Full output truncated" in result[-1]
-        assert "8 lines hidden" in result[-1]
         last_line_before_trunc_msg = result[-self.LINES_IN_TRUNCATION_MSG - 1]
         assert last_line_before_trunc_msg.endswith("...")
 
@@ -1621,7 +1731,6 @@ class TestTruncateExplanation:
         assert result != expl
         assert len(result) == 4 + self.LINES_IN_TRUNCATION_MSG
         assert "Full output truncated" in result[-1]
-        assert "7 lines hidden" in result[-1]
         last_line_before_trunc_msg = result[-self.LINES_IN_TRUNCATION_MSG - 1]
         assert last_line_before_trunc_msg.endswith("...")
 
@@ -1633,7 +1742,6 @@ class TestTruncateExplanation:
         assert result != expl
         assert len(result) == 1 + self.LINES_IN_TRUNCATION_MSG
         assert "Full output truncated" in result[-1]
-        assert "1000 lines hidden" in result[-1]
         last_line_before_trunc_msg = result[-self.LINES_IN_TRUNCATION_MSG - 1]
         assert last_line_before_trunc_msg.endswith("...")
 
@@ -1641,7 +1749,6 @@ class TestTruncateExplanation:
         """Test against full runpytest() output."""
         line_count = 7
         line_len = 100
-        expected_truncated_lines = 2
         pytester.makepyfile(
             rf"""
             def test_many_lines():
@@ -1660,7 +1767,7 @@ class TestTruncateExplanation:
             [
                 "*+ 1*",
                 "*+ 3*",
-                f"*truncated ({expected_truncated_lines} lines hidden)*use*-vv*",
+                "*Full output truncated*use*-vv*",
             ]
         )
 
@@ -1674,7 +1781,7 @@ class TestTruncateExplanation:
             [
                 "*+ 1*",
                 "*+ 3*",
-                f"*truncated ({expected_truncated_lines} lines hidden)*use*-vv*",
+                "*Full output truncated*use*-vv*",
             ]
         )
 
@@ -1689,7 +1796,7 @@ class TestTruncateExplanation:
             (4, None, 0),
             (0, None, 0),
             (None, 8, 6),
-            (None, 9, 0),
+            (None, 33, 0),
             (None, 0, 0),
             (0, 0, 0),
             (0, 1000, 0),
@@ -1716,7 +1823,7 @@ class TestTruncateExplanation:
 
         # This test produces 6 lines of diff output or 79 characters
         # So the effect should be when threshold is < 4 lines (considering 2 additional lines for explanation)
-        # Or < 9 characters (considering 70 additional characters for explanation)
+        # Or < 33 characters (considering the ~46-char footer slack, see truncate.TRUNCATION_FOOTER_CHARS)
 
         monkeypatch.delenv("CI", raising=False)
 
@@ -1730,9 +1837,7 @@ class TestTruncateExplanation:
         result = pytester.runpytest()
 
         if expected_lines_hidden != 0:
-            result.stdout.fnmatch_lines(
-                [f"*truncated ({expected_lines_hidden} lines hidden)*"]
-            )
+            result.stdout.fnmatch_lines(["*Full output truncated*"])
         else:
             result.stdout.no_fnmatch_line("*truncated*")
             result.stdout.fnmatch_lines(
@@ -1741,6 +1846,291 @@ class TestTruncateExplanation:
                     "*+ 3*",
                 ]
             )
+
+
+class TestMaterializeWithTruncation:
+    """Tests for ``truncate.materialize_with_truncation``.
+
+    Assertions check *behaviour* — that truncation kicks in / doesn't,
+    that the original lines are preserved, that the iterator's contract
+    is honoured — and never the literal footer wording. That way the
+    tests survive any future change to the truncation message format.
+    """
+
+    @staticmethod
+    def _config_with_limits(verbose: int = 0):
+        # Minimal stand-in for ``Config`` that ``materialize_with_truncation``
+        # uses through ``_get_truncation_parameters``.
+        class C:
+            def getini(self, name: str) -> object:
+                return None  # use defaults (8 lines / 640 chars)
+
+            def get_verbosity(self, _verbosity_type: str | None = None) -> int:
+                return verbose
+
+        return C()
+
+    def test_sized_input_returns_same_shape_as_iterator_input(self) -> None:
+        # When the input is already a sized container, the function still
+        # returns the truncated form; behaviour is the same as for an
+        # iterator over the same content.
+        content = [f"line {i}" for i in range(50)]
+        sized = truncate.materialize_with_truncation(
+            content, self._config_with_limits()
+        )
+        unsized = truncate.materialize_with_truncation(
+            iter(content), self._config_with_limits()
+        )
+        assert sized[0] == unsized[0] == "line 0"
+        assert any("truncated" in line for line in sized)
+        assert any("truncated" in line for line in unsized)
+
+    def test_truncation_disabled_returns_full_input(self) -> None:
+        # verbose >= 2 disables truncation; the iterator is fully drained.
+        lines = (f"line {i}" for i in range(50))
+        result = truncate.materialize_with_truncation(
+            lines, self._config_with_limits(verbose=2)
+        )
+        assert result == [f"line {i}" for i in range(50)]
+        assert not any("truncated" in line for line in result)
+
+    def test_idempotent_on_already_truncated_list(self) -> None:
+        # The dispatcher applies ``materialize_with_truncation`` after the
+        # built-in hook impl already truncated. Re-applying it must not
+        # corrupt the footer count or chop further lines.
+        once = truncate.materialize_with_truncation(
+            (f"line {i}" for i in range(200)), self._config_with_limits()
+        )
+        twice = truncate.materialize_with_truncation(once, self._config_with_limits())
+        assert twice == once
+
+    def test_does_not_over_consume_the_stream(self) -> None:
+        # Regression guard for laziness: an eager implementation that drains
+        # the whole iterator before truncating would still produce bounded
+        # output (so the other tests pass), but it would pull every line.
+        # This generator trips if drained past a small bound, so an eager
+        # impl fails deterministically — no wall-clock timing involved.
+        pulled = 0
+
+        def tripwire() -> Iterator[str]:
+            nonlocal pulled
+            for i in range(10_000):  # pragma: no branch
+                pulled += 1
+                yield f"line {i}"
+            raise AssertionError(  # pragma: no cover
+                "materialize_with_truncation drained the whole stream — "
+                "the explanation iterator is no longer consumed lazily"
+            )
+
+        result = truncate.materialize_with_truncation(
+            tripwire(), self._config_with_limits()
+        )
+        assert any("truncated" in line for line in result)
+        # A handful of lines past the 8-line cap, never the full stream.
+        assert pulled < 20
+
+    def test_pull_count_is_independent_of_input_size(self) -> None:
+        # Scaling invariance: the number of lines pulled to truncate must
+        # not grow with the input. Constant pulls ⇒ O(1) work regardless of
+        # how huge the comparison is. Catches an O(N) materialisation
+        # regression deterministically.
+        def count_pulls(n: int) -> int:
+            pulled = 0
+
+            def gen() -> Iterator[str]:
+                nonlocal pulled
+                for i in range(n):  # pragma: no branch
+                    pulled += 1
+                    yield f"line {i}"
+
+            truncate.materialize_with_truncation(gen(), self._config_with_limits())
+            return pulled
+
+        assert count_pulls(100) == count_pulls(100_000)
+
+    def _explain_capped(self, left: object, right: object) -> list[str]:
+        # Drive the comparison exactly as the dispatcher does: derive the
+        # pformat budget from the truncation limits, run the lazy
+        # ``assertrepr_compare`` generator, then materialise with truncation.
+        config = self._config_with_limits()
+        should, base = truncate._get_truncation_parameters(config)
+        cap = (
+            TruncationBudget(
+                max_lines=base.max_lines + 3 if base.max_lines > 0 else 0,
+                max_chars=base.max_chars + 70 if base.max_chars > 0 else 0,
+            )
+            if should
+            else NO_TRUNCATION_BUDGET
+        )
+        src = util.assertrepr_compare(
+            op="==",
+            left=left,
+            right=right,
+            verbose=1,
+            highlighter=util.dummy_highlighter,
+            assertion_text_diff_style=util.ASSERTION_TEXT_DIFF_STYLE_NDIFF,
+            truncation_budget=cap,
+        )
+        return truncate.materialize_with_truncation(src, config)
+
+    @pytest.mark.parametrize("shape", ["list", "tuple", "dict", "set"])
+    def test_formatting_work_is_bounded_for_a_10_line_display(self, shape: str) -> None:
+        # The real cost guard, exercised on every element-bearing
+        # comparison branch (sequence/iterable, mapping, set): a huge
+        # comparison that still displays only ~10 truncated lines must not
+        # *format* the whole input to get there. Wall-clock would catch an
+        # O(N) regression but flakes in CI, so we count the element
+        # ``repr`` calls instead — a deterministic, machine-independent
+        # proxy for the CPU work. With the pformat cap (sequence/mapping)
+        # or stream laziness (set) in place this stays flat as the input
+        # grows; lose either and it becomes O(N) (~200k reprs for N=100k)
+        # while the output is still 10 lines — which a line-count check
+        # misses. (The ``str``/ndiff branch has no element objects to
+        # count; it is guarded by ``test_text_diff_budget_caps_ndiff_input``.)
+        class Tracked:
+            reprs = 0
+
+            def __init__(self, v: int) -> None:
+                self.v = v
+
+            def __repr__(self) -> str:
+                Tracked.reprs += 1
+                return f"T({self.v})"
+
+            def __eq__(self, o: object) -> bool:
+                return isinstance(o, Tracked) and self.v == o.v
+
+            def __hash__(self) -> int:
+                return hash(self.v)
+
+        def make(n: int) -> tuple[object, object]:
+            # Build two near-identical containers of ``n`` elements that
+            # differ in exactly one spot, so the explanation is a real
+            # (truncated) diff rather than an empty one.
+            if shape in ("list", "tuple"):
+                seq_left = [Tracked(i) for i in range(n)]
+                seq_right = [Tracked(i) for i in range(n)]
+                seq_right[0] = Tracked(-1)
+                if shape == "tuple":
+                    return tuple(seq_left), tuple(seq_right)
+                return seq_left, seq_right
+            if shape == "dict":
+                map_left = {i: Tracked(i) for i in range(n)}
+                map_right = {i: Tracked(i) for i in range(n)}
+                map_right[0] = Tracked(-1)
+                return map_left, map_right
+            # set
+            set_left = {Tracked(i) for i in range(n)}
+            set_right = {Tracked(i) for i in range(n)}
+            set_right.discard(Tracked(0))
+            set_right.add(Tracked(-1))
+            return set_left, set_right
+
+        def work(n: int) -> tuple[int, int]:
+            left, right = make(n)
+            Tracked.reprs = 0  # count only the formatting, not the construction
+            out = self._explain_capped(left, right)
+            assert any("truncated" in line for line in out)
+            return len(out), Tracked.reprs
+
+        lines_small, reprs_small = work(1_000)
+        lines_big, reprs_big = work(100_000)
+        # Same small display either way ...
+        assert lines_small == lines_big
+        # ... for the same (bounded, input-independent) amount of work.
+        assert reprs_small == reprs_big
+        assert reprs_big < 200  # nowhere near the 100_000-element input
+
+
+class TestAssertReprCompareDispatcher:
+    """Tests for the budget wiring in ``plugin.pytest_assertrepr_compare``.
+
+    The ``callequal``/``callop`` helpers run the dispatcher with truncation
+    *disabled* (limits ``"0"`` ⇒ ``NO_TRUNCATION_BUDGET``), so they never
+    exercise the branch that derives a :class:`TruncationBudget` from the
+    truncation limits and feeds it to the comparison helpers. These tests
+    pass explicit limits to cover that path — including the partial-budget
+    arms where exactly one dimension is disabled. Behaviour only: the
+    footer wording is never asserted.
+    """
+
+    def test_both_limits_truncate_without_formatting_everything(self) -> None:
+        # Both limits set ⇒ budget is ``(lines+slack, chars+slack)``; a huge
+        # list comparison is truncated to a few lines and, crucially, the
+        # per-side pformat is capped so the element ``repr`` work stays
+        # bounded rather than scaling with the 50k-element input.
+        class Tracked:
+            reprs = 0
+
+            def __init__(self, v: int) -> None:
+                self.v = v
+
+            def __repr__(self) -> str:
+                Tracked.reprs += 1
+                return f"T({self.v})"
+
+            def __eq__(self, o: object) -> bool:
+                return isinstance(o, Tracked) and self.v == o.v
+
+        config = mock_config(
+            verbose=1,  # -v: emit the full diff that truncation then clips
+            truncation_limit_lines="4",
+            truncation_limit_chars="160",
+        )
+        left = [Tracked(i) for i in range(50_000)]
+        right = [Tracked(i) for i in range(50_000)]
+        right[0] = Tracked(-1)
+        Tracked.reprs = 0  # count only the formatting, not the construction
+        result = plugin.pytest_assertrepr_compare(config, "==", left, right)
+        assert result is not None
+        assert len(result) < 20
+        assert any("truncated" in line for line in result)
+        assert Tracked.reprs < 200  # nowhere near the 50k-element input
+
+    def test_chars_only_budget_still_truncates(self) -> None:
+        # ``truncation_limit_lines == 0`` ⇒ the ``max_lines`` budget arm is
+        # ``None`` (line cap disabled), but the char cap alone must still
+        # bound the explanation of a large multi-line diff.
+        config = mock_config(
+            verbose=1,  # -v: emit the full diff that truncation then clips
+            truncation_limit_lines="0",
+            truncation_limit_chars="160",
+        )
+        left = list(range(1000))
+        right = list(range(1, 1001))
+        result = plugin.pytest_assertrepr_compare(config, "==", left, right)
+        assert result is not None
+        assert any("truncated" in line for line in result)
+        assert sum(len(line) for line in result) < 1000
+
+    def test_lines_only_budget_still_truncates(self) -> None:
+        # ``truncation_limit_chars == 0`` ⇒ the ``max_chars`` budget arm is
+        # ``None`` (char cap disabled), but the line cap alone must still
+        # bound the explanation.
+        config = mock_config(
+            verbose=1,  # -v: emit the full diff that truncation then clips
+            truncation_limit_lines="4",
+            truncation_limit_chars="0",
+        )
+        left = list(range(1000))
+        right = list(range(1, 1001))
+        result = plugin.pytest_assertrepr_compare(config, "==", left, right)
+        assert result is not None
+        assert len(result) < 20
+        assert any("truncated" in line for line in result)
+
+    def test_no_terminalreporter_uses_plaintext_highlighter(self) -> None:
+        # Without the terminalreporter plugin the dispatcher must use the
+        # plaintext ``dummy_highlighter`` and never touch a terminal writer
+        # (#14377). ``mock_config.get_terminal_writer`` asserts it isn't
+        # reached, so taking the wrong branch fails the test.
+        config = mock_config(has_terminalreporter=False)
+        result = plugin.pytest_assertrepr_compare(config, "==", {1, 2}, {1, 3})
+        assert result is not None
+        # The set-comparison explanation is still produced via the plaintext
+        # path; no ANSI escape sequences leak in.
+        assert any("Extra items" in line for line in result)
+        assert not any("\x1b[" in line for line in result)
 
 
 def test_python25_compile_issue257(pytester: Pytester) -> None:
@@ -2268,6 +2658,128 @@ def test_exit_from_assertrepr_compare(monkeypatch) -> None:
         callequal(1, 1)
 
 
+def test_plugin_hook_returning_none_is_skipped(pytester: Pytester) -> None:
+    """A ``pytest_assertrepr_compare`` impl returning ``None`` is skipped
+    so the next impl (or the built-in) can produce the explanation.
+    Covers the ``if not new_expl: continue`` branch in ``callbinrepr``.
+    """
+    pytester.makeconftest(
+        """
+        def pytest_assertrepr_compare(op, left, right):
+            # Always defer to the next plugin / the built-in.
+            return None
+        """
+    )
+    pytester.makepyfile(
+        """
+        def test_diff():
+            assert {1, 2} == {1, 3}
+        """
+    )
+    result = pytester.runpytest()
+    # The built-in set-comparison explanation still reaches the user
+    # (so the None-returning hook did not swallow it).
+    result.stdout.fnmatch_lines(
+        ["*Extra items in the left set:*", "*Extra items in the right set:*"]
+    )
+
+
+def test_plugin_hook_returning_empty_iterator_is_skipped(pytester: Pytester) -> None:
+    """A plugin returning a truthy but ultimately empty iterable is
+    skipped after materialisation. Covers the second
+    ``if not new_expl: continue`` branch in ``callbinrepr``.
+    """
+    pytester.makeconftest(
+        """
+        def pytest_assertrepr_compare(op, left, right):
+            # An iterator object is truthy, so it slips past the first
+            # falsy check; once materialised through truncation it is
+            # empty and the dispatcher must move on.
+            return iter([])
+        """
+    )
+    pytester.makepyfile(
+        """
+        def test_diff():
+            assert {1, 2} == {1, 3}
+        """
+    )
+    result = pytester.runpytest()
+    # The built-in set-comparison explanation still reaches the user.
+    result.stdout.fnmatch_lines(
+        ["*Extra items in the left set:*", "*Extra items in the right set:*"]
+    )
+
+
+def test_callbinrepr_falls_through_when_all_hooks_return_none(
+    pytester: Pytester,
+) -> None:
+    """When every ``pytest_assertrepr_compare`` impl returns ``None``
+    (no specialised explanation applies, e.g. ``assert 1 == 2``), the
+    dispatcher exhausts ``hook_result``, exits the loop, and returns
+    ``None``. Covers the ``continue → loop exit`` branch on the first
+    ``if not new_expl: continue`` line.
+    """
+    pytester.makepyfile(
+        """
+        def test_trivial():
+            assert 1 == 2
+        """
+    )
+    result = pytester.runpytest()
+    # Just the plain ``assert 1 == 2`` rewrite, with no specialised
+    # comparator explanation appended (because the dispatcher fell
+    # through to ``return None``).
+    result.stdout.fnmatch_lines(["*assert 1 == 2*"])
+    result.assert_outcomes(failed=1)
+
+
+def test_callbinrepr_plain_assert_mode(pytester: Pytester) -> None:
+    """In ``--assert=plain`` mode ``callbinrepr`` skips the ``%`` escape.
+    Covers the false branch of ``if item.config.getvalue("assertmode")
+    == "rewrite"``.
+    """
+    pytester.makepyfile(
+        """
+        def test_diff():
+            assert {1, 2} == {1, 3}
+        """
+    )
+    result = pytester.runpytest("--assert=plain")
+    # In plain mode the comparator still runs via ``callbinrepr`` (it
+    # is the rewrite escaping that's skipped), so the explanation is
+    # still produced.
+    result.stdout.fnmatch_lines(
+        ["*Extra items in the left set:*", "*Extra items in the right set:*"]
+    )
+
+
+def test_exception_before_first_yield_emits_summary_and_notice(monkeypatch) -> None:
+    """When the comparator raises *before* any explanation line has been
+    yielded, ``assertrepr_compare`` should still produce the summary so
+    the reader sees what was being compared, then append the failure
+    notice. Covers the ``summary_yielded is False`` branch of the
+    exception handler.
+    """
+    from _pytest.assertion import _compare_any
+
+    def raise_value_error(obj):
+        raise ValueError("synthetic repr failure")
+
+    # ``istext`` is called inside ``_compare_eq_any`` before the first
+    # yield, so this triggers the failure path on the very first
+    # ``next()`` call from ``assertrepr_compare``.
+    monkeypatch.setattr(_compare_any, "istext", raise_value_error)
+
+    expl = callequal(1, 1)
+    assert expl is not None
+    # Summary line still produced.
+    assert expl[0] == "1 == 1"
+    # The failure notice survives in the output; wording deliberately not
+    # asserted, only the underlying error's signature.
+    assert any("ValueError" in line or "synthetic" in line for line in expl)
+
+
 def test_assertion_location_with_coverage(pytester: Pytester) -> None:
     """This used to report the wrong location when run with coverage (#5754)."""
     p = pytester.makepyfile(
@@ -2314,8 +2826,8 @@ def test_reprcompare_verbose_long() -> None:
             """,
             [
                 "{bold}{red}E         At index 1 diff: {reset}{number}1{hl-reset}{endline} != {reset}{number}2*",
-                "{bold}{red}E         {light-red}-     2,{hl-reset}{endline}{reset}",
-                "{bold}{red}E         {light-green}+     1,{hl-reset}{endline}{reset}",
+                "{bold}{red}E         {reset}{light-red}-     2,{hl-reset}{endline}{reset}",
+                "{bold}{red}E         {reset}{light-green}+     1,{hl-reset}{endline}{reset}",
             ],
         ),
         (
@@ -2333,8 +2845,8 @@ def test_reprcompare_verbose_long() -> None:
                 "{bold}{red}E         Right contains 1 more item:{reset}",
                 "{bold}{red}E         {reset}{{{str}'{hl-reset}{str}number-is-0{hl-reset}{str}'{hl-reset}: {number}0*",
                 "{bold}{red}E         {reset}{light-gray} {hl-reset} {{{endline}{reset}",
-                "{bold}{red}E         {light-gray} {hl-reset}     'number-is-1': 1,{endline}{reset}",
-                "{bold}{red}E         {light-green}+     'number-is-5': 5,{hl-reset}{endline}{reset}",
+                "{bold}{red}E         {reset}{light-gray} {hl-reset}     'number-is-1': 1,{endline}{reset}",
+                "{bold}{red}E         {reset}{light-green}+     'number-is-5': 5,{hl-reset}{endline}{reset}",
             ],
         ),
         (
